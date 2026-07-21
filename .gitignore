@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.env
+data/index/*
+!data/index/.gitkeep
+all_documents
+.idea
