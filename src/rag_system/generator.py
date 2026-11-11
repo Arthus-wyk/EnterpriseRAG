@@ -5,21 +5,69 @@ from .config import CONFIG, normalize_model_provider
 from .http_client import urlopen_with_provider_limits
 from .splitter import Chunk
 
-
 SYSTEM_PROMPT = """You are an enterprise RAG answer generator.
 Answer the question using only the retrieved context.
 If the context does not contain enough evidence, say that the answer is not available in the retrieved context.
 Be concise, factual, and include exact names, numbers, and limits when present.
 """
+QUERY_REWRITE_SYSTEM_PROMPT = """
+You rewrite user questions into search queries for an enterprise RAG system.
+
+The document corpus is primarily English. Produce exactly two English queries:
+
+1. keyword_query:
+   A compact lexical query for BM25. Keep important entities, product names,
+   identifiers, flags, file paths, error messages, versions, numbers, limits,
+   and quoted strings. Add only directly implied synonyms.
+
+2. semantic_query:
+   A clear, standalone paraphrase for vector search. Preserve the original
+   intent, constraints, entities, and requested details.
+
+Rules:
+- Do not answer the question.
+- Do not invent names, identifiers, facts, or constraints.
+- Remove conversational filler.
+- Preserve exact technical tokens whenever possible.
+- Return valid JSON only, without Markdown or explanation.
+- Use this exact schema:
+  {"keyword_query": "...", "semantic_query": "..."}
+""".strip()
+
+QUERY_REWRITE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "keyword_query": {
+            "type": "string",
+            "minLength": 1,
+        },
+        "semantic_query": {
+            "type": "string",
+            "minLength": 1,
+        },
+    },
+    "required": [
+        "keyword_query",
+        "semantic_query",
+    ],
+    "additionalProperties": False,
+}
+
+
+def build_query_rewrite_prompt(question: str) -> str:
+    return f"""Rewrite this question for retrieval:
+
+{question}
+"""
 
 
 class Generator:
     def __init__(
-        self,
-        model: str = CONFIG.ollama_llm_model,
-        base_url: str | None = None,
-        api_key: str | None = None,
-        provider: str | None = None,
+            self,
+            model: str = CONFIG.ollama_llm_model,
+            base_url: str | None = None,
+            api_key: str | None = None,
+            provider: str | None = None,
     ) -> None:
         self.provider = normalize_model_provider(provider or CONFIG.model_provider)
         self.model = self._normalize_model_for_provider(model)
@@ -33,18 +81,26 @@ class Generator:
         prompt = build_prompt(question, contexts)
         return self._generate_with_ollama(prompt)
 
-    def _generate_with_ollama(self, prompt: str) -> str:
-        body = json.dumps(
-            {
-                "model": self.model,
-                "prompt": prompt,
-                "system": SYSTEM_PROMPT,
-                "stream": False,
-                "options": {
-                    "temperature": 0,
-                },
-            }
-        ).encode("utf-8")
+    def _generate_with_ollama(
+            self, prompt: str,
+            system_prompt: str = SYSTEM_PROMPT,
+            response_format: dict | str | None = None,
+    ) -> str:
+        request_body = {
+            "model": self.model,
+            "prompt": prompt,
+            "system": system_prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0,
+            },
+        }
+
+        if response_format is not None:
+            request_body["format"] = response_format
+
+        body = json.dumps(request_body).encode("utf-8")
+
         req = request.Request(
             f"{self.base_url}/api/generate",
             data=body,
@@ -77,6 +133,49 @@ class Generator:
             raise RuntimeError(f"Unexpected Ollama generation response: {payload}")
 
         return answer.strip()
+
+    def rewrite_queries(self, question: str) -> dict[str, str]:
+        fallback = {
+            "keyword_query": question,
+            "semantic_query": question,
+        }
+        prompt = (
+            "Rewrite the question contained in this JSON object.\n"
+            f"Required output schema:\n"
+            f"{json.dumps(QUERY_REWRITE_SCHEMA)}\n"
+            f"Input:\n"
+            f"{json.dumps({'question': question}, ensure_ascii=False)}"
+        )
+
+        try:
+            response = self._generate_with_ollama(
+                prompt,
+                system_prompt=QUERY_REWRITE_SYSTEM_PROMPT,
+                response_format=QUERY_REWRITE_SCHEMA,
+            )
+            payload = json.loads(response)
+
+            if not isinstance(payload, dict):
+                raise ValueError("Response must be a JSON object")
+
+            if set(payload) != {"keyword_query", "semantic_query"}:
+                raise ValueError(f"Unexpected fields: {set(payload)}")
+
+            keyword_query = payload.get("keyword_query")
+            semantic_query = payload.get("semantic_query")
+
+            if not isinstance(keyword_query, str) or not keyword_query.strip():
+                raise ValueError("keyword_query must be a non-empty string")
+            if not isinstance(semantic_query, str) or not semantic_query.strip():
+                raise ValueError("semantic_query must be a non-empty string")
+
+            return {
+                "keyword_query": keyword_query.strip(),
+                "semantic_query": semantic_query.strip(),
+            }
+        except (RuntimeError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            print(f"[rewrite] invalid response, using original question: {exc}")
+            return fallback
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}

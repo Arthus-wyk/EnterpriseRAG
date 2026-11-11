@@ -1,17 +1,21 @@
 import pickle
 from dataclasses import dataclass
 
-from .config import CONFIG
-from .embeddings import OllamaEmbeddingClient
-from .retrieval_utils import INDEX_FILE, BM25_INDEX_FILE, tokenize
-from .splitter import Chunk
+from config import CONFIG
+from embeddings import OllamaEmbeddingClient
+from retrieval_utils import INDEX_FILE, BM25_INDEX_FILE, tokenize
+from splitter import Chunk
 
 
 @dataclass(frozen=True)
 class RetrievalResults:
     bm25_results: list[tuple[Chunk, float]]
     vector_results: list[tuple[Chunk, float]]
-    rrf_results: list[tuple[Chunk, float]]
+    candidates: list[tuple[Chunk, float]]
+
+    @property
+    def rrf_results(self) -> list[tuple[Chunk, float]]:
+        return self.candidates
 
 
 class Retriever:
@@ -89,70 +93,54 @@ class Retriever:
     def search_with_stages(
             self,
             query: str,
+            bm25_query: str | None = None,
+            vector_query: str | None = None,
             bm25_top_k: int | None = None,
             vector_top_k: int | None = None,
             rrf_top_k: int | None = None,
+
     ) -> RetrievalResults:
-        k = rrf_top_k or CONFIG.rrf_top_k
         bm25_k = bm25_top_k or CONFIG.bm25_top_k
         vector_k = vector_top_k or CONFIG.vector_top_k
-        vector_weight = 0.6
-        bm25_weight = 0.4
 
-        rrf_k = 60
-        vector_results = self.vector_search(query, vector_k)
         bm25_results = self.bm25_search(query, bm25_k)
+        if bm25_query and bm25_query != query:
+            bm25_results += self.bm25_search(bm25_query, bm25_k)
 
-        fused_scores: dict[int, float] = {}
+        vector_results = self.vector_search(query, vector_k)
+        if vector_query and vector_query != query:
+            vector_results += self.vector_search(vector_query, vector_k)
 
-        for rank, (index, _score) in enumerate(vector_results, start=1):
-            fused_scores[index] = fused_scores.get(index, 0.0) + vector_weight / (rrf_k + rank)
+        def unique_chunks(results: list[tuple[int, float]]) -> list[tuple[Chunk, float]]:
+            unique: dict[str, tuple[Chunk, float]] = {}
+            for index, score in results:
+                chunk = self.chunks[index]
+                unique.setdefault(chunk.metadata["chunk_id"], (chunk, float(score)))
+            return list(unique.values())
 
-        for rank, (index, _score) in enumerate(bm25_results, start=1):
-            fused_scores[index] = fused_scores.get(index, 0.0) + bm25_weight / (rrf_k + rank)
-
-        if CONFIG.folder_boost_enabled:
-            for index in list(fused_scores):
-                fused_scores[index] += (
-                    CONFIG.folder_boost_weight
-                    * self.folder_boost_score(query, self.chunks[index])
-                )
-
-        top_indices = sorted(
-            fused_scores.keys(),
-            key=lambda index: fused_scores[index],
-            reverse=True
-        )[:k]
-
-        bm25_chunks = [
-            (self.chunks[index], float(score))
-            for index, score in bm25_results
-        ]
-        vector_chunks = [
-            (self.chunks[index], float(score))
-            for index, score in vector_results
-        ]
-        rrf_chunks = [
-            (self.chunks[index], float(fused_scores[index]))
-            for index in top_indices
-        ]
+        bm25_chunks = unique_chunks(bm25_results)
+        vector_chunks = unique_chunks(vector_results)
+        candidates = unique_chunks(bm25_results + vector_results)
 
         return RetrievalResults(
             bm25_results=bm25_chunks,
             vector_results=vector_chunks,
-            rrf_results=rrf_chunks,
+            candidates=candidates,
         )
 
     def search(
             self,
             query: str,
+            rewrite_query: dict[str, str],
             top_k: int | None = None,
             bm25_top_k: int | None = None,
             vector_top_k: int | None = None,
     ) -> list[tuple[Chunk, float]]:
         return self.search_with_stages(
             query=query,
+            bm25_query=rewrite_query["keyword_query"],
+            vector_query=rewrite_query["semantic_query"],
             bm25_top_k=bm25_top_k,
             vector_top_k=vector_top_k,
             rrf_top_k=top_k,
-        ).rrf_results
+        ).candidates

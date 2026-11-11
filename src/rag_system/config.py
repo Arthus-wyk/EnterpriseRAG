@@ -30,7 +30,7 @@ def normalize_model_provider(value: str) -> str:
 @dataclass(frozen=True)
 class RagConfig:
     raw_data_dir: Path = PROJECT_ROOT / "all_documents"
-    index_dir: Path = PROJECT_ROOT / "all_documents"
+    index_dir: Path = PROJECT_ROOT / "all_documents/github"
     chunk_size: int = int(os.getenv("CHUNK_SIZE", "600"))
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "80"))
     bm25_top_k: int = int(os.getenv("BM25_TOP_K", "100"))

@@ -258,17 +258,20 @@ def evaluate_question(
         include_context_text: bool,
 ) -> EvaluationResult:
     print(f"[eval] retrieving {record.question_id}", flush=True)
+    rewritten_queries = generator.rewrite_queries(record.question)
     stage_results = retriever.search_with_stages(
         query=record.question,
+        bm25_query=rewritten_queries["keyword_query"],
+        vector_query=rewritten_queries["semantic_query"],
         bm25_top_k=bm25_top_k,
         vector_top_k=vector_top_k,
         rrf_top_k=rrf_top_k,
     )
-    candidates = stage_results.rrf_results
+    candidates = stage_results.candidates
     print(
         f"[eval] {record.question_id}: candidates "
         f"bm25={len(stage_results.bm25_results)}, "
-        f"vector={len(stage_results.vector_results)}, rrf={len(candidates)}",
+        f"vector={len(stage_results.vector_results)}, merged={len(candidates)}",
         flush=True,
     )
     contexts = (
